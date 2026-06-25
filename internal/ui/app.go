@@ -5,6 +5,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -12,6 +14,10 @@ import (
 	"manukers/internal/aws"
 	"manukers/internal/ui/views"
 )
+
+const footerNormal = " [yellow]Esc[-] Back  [yellow]r[-] Refresh  [yellow]/[-] Filter  [yellow]:[- ]Command  [yellow]q[-] Quit"
+
+var spinFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 // ─── View IDs ────────────────────────────────────────────────────────────────
 
@@ -58,22 +64,28 @@ type App struct {
 	client      *aws.Client
 	currentView string // which resource is active inside resourcePages
 
-	pickerView  *views.PickerView
+	pickerView   *views.PickerView
 	overviewView *views.OverviewView // kept for completeness; not in picker
-	ec2View     *views.EC2View
-	lbView      *views.LBView
-	tgView      *views.TGView
-	sgView      *views.SGView
-	eksView     *views.EKSView
-	graphView   *views.GraphView
-	ecrView     *views.ECRView
-	s3View      *views.S3View
+	ec2View      *views.EC2View
+	lbView       *views.LBView
+	tgView       *views.TGView
+	sgView       *views.SGView
+	eksView      *views.EKSView
+	graphView    *views.GraphView
+	ecrView      *views.ECRView
+	s3View       *views.S3View
 
 	// Per-view fetch tracking (load once, manual refresh via r).
 	// No auto-refresh — API calls only happen on explicit user action.
 	viewFetched  map[string]bool
 	viewFetching map[string]bool
 	mu           sync.Mutex
+
+	// Footer spinner
+	footer       *tview.TextView
+	spinCount    atomic.Int32 // number of concurrent loads in flight
+	spinStop     chan struct{} // closed when the last load finishes
+	spinMu       sync.Mutex
 }
 
 // NewApp creates and initialises the application.  No AWS calls are made here.
@@ -129,11 +141,10 @@ func (a *App) buildLayout() {
 	})
 
 	// Footer for the resource view area.
-	footer := tview.NewTextView().SetDynamicColors(true)
-	footer.SetBackgroundColor(tcell.ColorDarkSlateGray)
-	footer.SetText(
-		" [yellow]Esc[-] Back  [yellow]r[-] Refresh  [yellow]/[-] Filter  [yellow]:[- ]Command  [yellow]q[-] Quit",
-	)
+	a.footer = tview.NewTextView().SetDynamicColors(true)
+	a.footer.SetBackgroundColor(tcell.ColorDarkSlateGray)
+	a.footer.SetText(footerNormal)
+	footer := a.footer
 
 	// Command bar: hint + input (shown instead of footer when : is pressed).
 	a.cmdHint = tview.NewTextView().SetDynamicColors(true)
@@ -231,12 +242,55 @@ func (a *App) doLoad(id string) {
 	a.viewFetching[id] = true
 	a.mu.Unlock()
 
+	a.startSpinner(id)
 	v.Refresh(context.Background())
+	a.stopSpinner()
 
 	a.mu.Lock()
 	a.viewFetched[id] = true
 	a.viewFetching[id] = false
 	a.mu.Unlock()
+}
+
+func (a *App) startSpinner(label string) {
+	a.spinMu.Lock()
+	defer a.spinMu.Unlock()
+	if a.spinCount.Add(1) == 1 {
+		// First load in flight — spawn the animation goroutine.
+		stop := make(chan struct{})
+		a.spinStop = stop
+		go func() {
+			tick := time.NewTicker(80 * time.Millisecond)
+			defer tick.Stop()
+			frame := 0
+			for {
+				select {
+				case <-stop:
+					a.tviewApp.QueueUpdateDraw(func() {
+						a.footer.SetText(footerNormal)
+					})
+					return
+				case <-tick.C:
+					f := spinFrames[frame%len(spinFrames)]
+					frame++
+					lbl := label
+					a.tviewApp.QueueUpdateDraw(func() {
+						a.footer.SetText(" [aqua]" + f + "[-] Loading " + lbl + "…  [darkgray]" +
+							footerNormal[1:] + "[-]")
+					})
+				}
+			}
+		}()
+	}
+}
+
+func (a *App) stopSpinner() {
+	a.spinMu.Lock()
+	defer a.spinMu.Unlock()
+	if a.spinCount.Add(-1) == 0 && a.spinStop != nil {
+		close(a.spinStop)
+		a.spinStop = nil
+	}
 }
 
 type refreshable interface{ Refresh(ctx context.Context) }
