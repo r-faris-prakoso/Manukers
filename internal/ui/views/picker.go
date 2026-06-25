@@ -74,12 +74,24 @@ func (v *PickerView) build(region string) {
 		)
 	}
 
-	header := tview.NewTextView().
+	// Art is left-aligned inside a fixed 52-char view (width of the longest art
+	// line) so its internal spacing is preserved. The FlexColumn spacers centre
+	// that block within the panel without distorting individual lines.
+	artView := tview.NewTextView().
+		SetDynamicColors(true).
+		SetTextAlign(tview.AlignLeft)
+	artView.SetText("[yellow]" + compactArt + "[-]")
+
+	artRow := tview.NewFlex().SetDirection(tview.FlexColumn).
+		AddItem(tview.NewBox(), 0, 1, false).
+		AddItem(artView, 52, 0, false).
+		AddItem(tview.NewBox(), 0, 1, false)
+
+	titleView := tview.NewTextView().
 		SetDynamicColors(true).
 		SetTextAlign(tview.AlignCenter)
-	header.SetText(
-		"[yellow]" + compactArt + "[-]\n" +
-			"[aqua::b]MANUKERS[-:-:-]\n" +
+	titleView.SetText(
+		"[aqua::b]MANUKERS[-:-:-]\n" +
 			"[darkgray]AWS Infrastructure Explorer[-]\n" +
 			fmt.Sprintf("[white]region:[-] [aqua]%s[-]\n", region),
 	)
@@ -91,7 +103,8 @@ func (v *PickerView) build(region string) {
 	footer.SetText("[yellow]↑↓[-] Navigate  [yellow]Enter[-] Open  [yellow]q[-] Quit  [yellow]:[-] Command")
 
 	panel := tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(header, 17, 0, false). // art(12) + title(2) + region(1) + spacing(2)
+		AddItem(artRow, 12, 0, false).  // 12 art lines, preserved layout
+		AddItem(titleView, 5, 0, false). // MANUKERS + subtitle + region + spacing
 		AddItem(v.list, 0, 1, true).
 		AddItem(footer, 1, 0, false)
 	panel.SetBorder(true).SetBorderColor(tcell.ColorDarkCyan)
