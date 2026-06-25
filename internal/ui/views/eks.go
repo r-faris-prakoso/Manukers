@@ -21,6 +21,7 @@ type EKSView struct {
 	pages    *tview.Pages
 	eksTable *tview.Table
 	clusters []aws.EKSCluster
+	filter   string
 }
 
 func NewEKSView(app *tview.Application, client *aws.Client) *EKSView {
@@ -29,11 +30,20 @@ func NewEKSView(app *tview.Application, client *aws.Client) *EKSView {
 		client: client,
 		pages:  tview.NewPages(),
 	}
-	v.eksTable = newStyledTable(" EKS Clusters  <Enter> Details ")
+	v.eksTable = newStyledTable(" EKS Clusters  <Enter> Details  </> Filter ")
 	v.eksTable.SetSelectedFunc(func(row, col int) {
-		if row > 0 && row <= len(v.clusters) {
-			v.openClusterDetail(v.clusters[row-1])
+		cell := v.eksTable.GetCell(row, 0)
+		if cell == nil || cell.GetReference() == nil {
+			return
 		}
+		v.openClusterDetail(*cell.GetReference().(*aws.EKSCluster))
+	})
+	v.eksTable.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Rune() == '/' {
+			v.openFilter()
+			return nil
+		}
+		return event
 	})
 	v.pages.AddPage("list", v.eksTable, true, true)
 	return v
@@ -58,24 +68,57 @@ func (v *EKSView) updateEKSTable() {
 	for col, h := range []string{"NAME", "STATUS", "VERSION", "VPC", "ENDPOINT"} {
 		v.eksTable.SetCell(0, col, headerCell(h))
 	}
-	for i, cl := range v.clusters {
-		row := i + 1
+	row := 1
+	for i := range v.clusters {
+		cl := v.clusters[i]
+		if v.filter != "" && !strings.Contains(strings.ToLower(cl.Name), strings.ToLower(v.filter)) {
+			continue
+		}
 		sc := theme.StateColor(cl.Status)
 		icon := theme.StateIcon(cl.Status)
 		ep := cl.Endpoint
 		if len(ep) > 45 {
 			ep = ep[:42] + "…"
 		}
-		v.eksTable.SetCell(row, 0, tview.NewTableCell(" "+cl.Name).SetTextColor(tcell.ColorWhite))
+		v.eksTable.SetCell(row, 0, tview.NewTableCell(" "+cl.Name).
+			SetTextColor(tcell.ColorWhite).SetReference(&v.clusters[i]))
 		v.eksTable.SetCell(row, 1, tview.NewTableCell(" "+icon+" "+cl.Status).SetTextColor(sc))
 		v.eksTable.SetCell(row, 2, tview.NewTableCell(" "+cl.Version).SetTextColor(tcell.ColorAqua))
 		v.eksTable.SetCell(row, 3, tview.NewTableCell(" "+orDash(cl.VpcID)).SetTextColor(tcell.ColorDarkGray))
 		v.eksTable.SetCell(row, 4, tview.NewTableCell(" "+orDash(ep)).SetTextColor(tcell.ColorDarkGray))
+		row++
 	}
-	if len(v.clusters) == 0 {
-		v.eksTable.SetCell(1, 0, tview.NewTableCell("  No EKS clusters found").
-			SetTextColor(tcell.ColorDarkGray).SetSelectable(false))
+	if row == 1 {
+		msg := "  No EKS clusters found"
+		if v.filter != "" {
+			msg = fmt.Sprintf("  No results for \"%s\"  [Esc to clear]", v.filter)
+		}
+		v.eksTable.SetCell(1, 0, tview.NewTableCell(msg).SetTextColor(tcell.ColorDarkGray).SetSelectable(false))
 	}
+}
+
+func (v *EKSView) openFilter() {
+	input := tview.NewInputField().
+		SetLabel("  / Filter: ").
+		SetFieldWidth(30).
+		SetText(v.filter).
+		SetFieldTextColor(tcell.ColorWhite).
+		SetFieldBackgroundColor(tcell.ColorDarkSlateBlue)
+	input.SetDoneFunc(func(key tcell.Key) {
+		if key == tcell.KeyEnter {
+			v.filter = input.GetText()
+		} else {
+			v.filter = ""
+		}
+		v.pages.RemovePage("filter")
+		v.app.SetFocus(v.eksTable)
+		v.updateEKSTable()
+	})
+	filterLayout := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(v.eksTable, 0, 1, false).
+		AddItem(input, 1, 0, true)
+	v.pages.AddAndSwitchToPage("filter", filterLayout, true)
+	v.app.SetFocus(input)
 }
 
 func (v *EKSView) openClusterDetail(cl aws.EKSCluster) {

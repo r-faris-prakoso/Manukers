@@ -19,6 +19,7 @@ type ECRView struct {
 	pages     *tview.Pages
 	repoTable *tview.Table
 	repos     []aws.ECRRepository
+	filter    string
 }
 
 func NewECRView(app *tview.Application, client *aws.Client) *ECRView {
@@ -27,11 +28,20 @@ func NewECRView(app *tview.Application, client *aws.Client) *ECRView {
 		client: client,
 		pages:  tview.NewPages(),
 	}
-	v.repoTable = newStyledTable(" ECR Repositories  <Enter> Images ")
+	v.repoTable = newStyledTable(" ECR Repositories  <Enter> Images  </> Filter ")
 	v.repoTable.SetSelectedFunc(func(row, col int) {
-		if row > 0 && row <= len(v.repos) {
-			v.openImages(v.repos[row-1])
+		cell := v.repoTable.GetCell(row, 0)
+		if cell == nil || cell.GetReference() == nil {
+			return
 		}
+		v.openImages(*cell.GetReference().(*aws.ECRRepository))
+	})
+	v.repoTable.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Rune() == '/' {
+			v.openFilter()
+			return nil
+		}
+		return event
 	})
 	v.pages.AddPage("list", v.repoTable, true, true)
 	return v
@@ -57,8 +67,12 @@ func (v *ECRView) updateRepoTable() {
 	for col, h := range []string{"NAME", "URI", "MUTABILITY", "SCAN ON PUSH", "CREATED"} {
 		v.repoTable.SetCell(0, col, headerCell(h))
 	}
-	for i, repo := range v.repos {
-		row := i + 1
+	row := 1
+	for i := range v.repos {
+		repo := v.repos[i]
+		if v.filter != "" && !strings.Contains(strings.ToLower(repo.Name), strings.ToLower(v.filter)) {
+			continue
+		}
 		mut := repo.Mutability
 		mutColor := tcell.ColorGreen
 		if mut == "IMMUTABLE" {
@@ -74,16 +88,45 @@ func (v *ECRView) updateRepoTable() {
 			scanText = "on"
 			scanColor = tcell.ColorGreen
 		}
-		v.repoTable.SetCell(row, 0, tview.NewTableCell(" "+repo.Name).SetTextColor(tcell.ColorWhite))
+		v.repoTable.SetCell(row, 0, tview.NewTableCell(" "+repo.Name).
+			SetTextColor(tcell.ColorWhite).SetReference(&v.repos[i]))
 		v.repoTable.SetCell(row, 1, tview.NewTableCell(" "+repo.URI).SetTextColor(tcell.ColorDarkGray).SetMaxWidth(60))
 		v.repoTable.SetCell(row, 2, tview.NewTableCell(" "+mut).SetTextColor(mutColor))
 		v.repoTable.SetCell(row, 3, tview.NewTableCell(" "+scanText).SetTextColor(scanColor))
 		v.repoTable.SetCell(row, 4, tview.NewTableCell(" "+created).SetTextColor(tcell.ColorDarkGray))
+		row++
 	}
-	if len(v.repos) == 0 {
-		v.repoTable.SetCell(1, 0, tview.NewTableCell("  No ECR repositories found").
-			SetTextColor(tcell.ColorDarkGray).SetSelectable(false))
+	if row == 1 {
+		msg := "  No ECR repositories found"
+		if v.filter != "" {
+			msg = fmt.Sprintf("  No results for \"%s\"  [Esc to clear]", v.filter)
+		}
+		v.repoTable.SetCell(1, 0, tview.NewTableCell(msg).SetTextColor(tcell.ColorDarkGray).SetSelectable(false))
 	}
+}
+
+func (v *ECRView) openFilter() {
+	input := tview.NewInputField().
+		SetLabel("  / Filter: ").
+		SetFieldWidth(30).
+		SetText(v.filter).
+		SetFieldTextColor(tcell.ColorWhite).
+		SetFieldBackgroundColor(tcell.ColorDarkSlateBlue)
+	input.SetDoneFunc(func(key tcell.Key) {
+		if key == tcell.KeyEnter {
+			v.filter = input.GetText()
+		} else {
+			v.filter = ""
+		}
+		v.pages.RemovePage("filter")
+		v.app.SetFocus(v.repoTable)
+		v.updateRepoTable()
+	})
+	filterLayout := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(v.repoTable, 0, 1, false).
+		AddItem(input, 1, 0, true)
+	v.pages.AddAndSwitchToPage("filter", filterLayout, true)
+	v.app.SetFocus(input)
 }
 
 // openImages shows a loading page instantly, then fetches images in the background.

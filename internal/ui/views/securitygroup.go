@@ -3,6 +3,7 @@ package views
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -18,6 +19,7 @@ type SGView struct {
 	pages   *tview.Pages
 	sgTable *tview.Table
 	sgs     []aws.SecurityGroup
+	filter  string
 }
 
 func NewSGView(app *tview.Application, client *aws.Client) *SGView {
@@ -26,11 +28,20 @@ func NewSGView(app *tview.Application, client *aws.Client) *SGView {
 		client: client,
 		pages:  tview.NewPages(),
 	}
-	v.sgTable = newStyledTable(" Security Groups  <Enter> Rules ")
+	v.sgTable = newStyledTable(" Security Groups  <Enter> Rules  </> Filter ")
 	v.sgTable.SetSelectedFunc(func(row, col int) {
-		if row > 0 && row <= len(v.sgs) {
-			v.openRules(v.sgs[row-1])
+		cell := v.sgTable.GetCell(row, 0)
+		if cell == nil || cell.GetReference() == nil {
+			return
 		}
+		v.openRules(*cell.GetReference().(*aws.SecurityGroup))
+	})
+	v.sgTable.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Rune() == '/' {
+			v.openFilter()
+			return nil
+		}
+		return event
 	})
 	v.pages.AddPage("list", v.sgTable, true, true)
 	return v
@@ -55,19 +66,54 @@ func (v *SGView) updateSGTable() {
 	for col, h := range []string{"NAME", "GROUP ID", "VPC", "DESCRIPTION", "INBOUND", "OUTBOUND"} {
 		v.sgTable.SetCell(0, col, headerCell(h))
 	}
-	for i, sg := range v.sgs {
-		row := i + 1
-		v.sgTable.SetCell(row, 0, tview.NewTableCell(" "+sg.Name).SetTextColor(tcell.ColorWhite))
+	row := 1
+	for i := range v.sgs {
+		sg := v.sgs[i]
+		if v.filter != "" &&
+			!strings.Contains(strings.ToLower(sg.Name), strings.ToLower(v.filter)) &&
+			!strings.Contains(strings.ToLower(sg.ID), strings.ToLower(v.filter)) {
+			continue
+		}
+		v.sgTable.SetCell(row, 0, tview.NewTableCell(" "+sg.Name).
+			SetTextColor(tcell.ColorWhite).SetReference(&v.sgs[i]))
 		v.sgTable.SetCell(row, 1, tview.NewTableCell(" "+sg.ID).SetTextColor(tcell.ColorAqua))
 		v.sgTable.SetCell(row, 2, tview.NewTableCell(" "+orDash(sg.VpcID)).SetTextColor(tcell.ColorDarkGray))
 		v.sgTable.SetCell(row, 3, tview.NewTableCell(" "+sg.Description).SetTextColor(tcell.ColorDarkGray).SetMaxWidth(40))
 		v.sgTable.SetCell(row, 4, tview.NewTableCell(fmt.Sprintf("  %d rules", len(sg.InboundRules))).SetTextColor(tcell.ColorWhite))
 		v.sgTable.SetCell(row, 5, tview.NewTableCell(fmt.Sprintf("  %d rules", len(sg.OutboundRules))).SetTextColor(tcell.ColorWhite))
+		row++
 	}
-	if len(v.sgs) == 0 {
-		v.sgTable.SetCell(1, 0, tview.NewTableCell("  No security groups found").
-			SetTextColor(tcell.ColorDarkGray).SetSelectable(false))
+	if row == 1 {
+		msg := "  No security groups found"
+		if v.filter != "" {
+			msg = fmt.Sprintf("  No results for \"%s\"  [Esc to clear]", v.filter)
+		}
+		v.sgTable.SetCell(1, 0, tview.NewTableCell(msg).SetTextColor(tcell.ColorDarkGray).SetSelectable(false))
 	}
+}
+
+func (v *SGView) openFilter() {
+	input := tview.NewInputField().
+		SetLabel("  / Filter: ").
+		SetFieldWidth(30).
+		SetText(v.filter).
+		SetFieldTextColor(tcell.ColorWhite).
+		SetFieldBackgroundColor(tcell.ColorDarkSlateBlue)
+	input.SetDoneFunc(func(key tcell.Key) {
+		if key == tcell.KeyEnter {
+			v.filter = input.GetText()
+		} else {
+			v.filter = ""
+		}
+		v.pages.RemovePage("filter")
+		v.app.SetFocus(v.sgTable)
+		v.updateSGTable()
+	})
+	filterLayout := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(v.sgTable, 0, 1, false).
+		AddItem(input, 1, 0, true)
+	v.pages.AddAndSwitchToPage("filter", filterLayout, true)
+	v.app.SetFocus(input)
 }
 
 func (v *SGView) openRules(sg aws.SecurityGroup) {

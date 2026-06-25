@@ -3,6 +3,7 @@ package views
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -21,6 +22,7 @@ type TGView struct {
 	pages   *tview.Pages
 	tgTable *tview.Table
 	tgs     []aws.TargetGroup
+	filter  string
 
 	// health monitor state
 	monitoring  int32 // atomic: 1 when detail is open
@@ -33,11 +35,20 @@ func NewTGView(app *tview.Application, client *aws.Client) *TGView {
 		client: client,
 		pages:  tview.NewPages(),
 	}
-	v.tgTable = newStyledTable(" Target Groups  <Enter> Health Monitor ")
+	v.tgTable = newStyledTable(" Target Groups  <Enter> Health Monitor  </> Filter ")
 	v.tgTable.SetSelectedFunc(func(row, col int) {
-		if row > 0 && row <= len(v.tgs) {
-			v.openHealthMonitor(v.tgs[row-1])
+		cell := v.tgTable.GetCell(row, 0)
+		if cell == nil || cell.GetReference() == nil {
+			return
 		}
+		v.openHealthMonitor(*cell.GetReference().(*aws.TargetGroup))
+	})
+	v.tgTable.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Rune() == '/' {
+			v.openTGFilter()
+			return nil
+		}
+		return event
 	})
 	v.pages.AddPage("list", v.tgTable, true, true)
 	return v
@@ -72,8 +83,12 @@ func (v *TGView) updateTGTable() {
 		v.tgTable.SetCell(0, col, headerCell(h))
 	}
 
-	for i, tg := range v.tgs {
-		row := i + 1
+	row := 1
+	for i := range v.tgs {
+		tg := v.tgs[i]
+		if v.filter != "" && !strings.Contains(strings.ToLower(tg.Name), strings.ToLower(v.filter)) {
+			continue
+		}
 		healthy, total := countHealth(tg.Targets)
 		hColor := tcell.ColorGreen
 		if total > 0 && healthy < total {
@@ -82,26 +97,52 @@ func (v *TGView) updateTGTable() {
 		if total > 0 && healthy == 0 {
 			hColor = tcell.ColorRed
 		}
-
 		protoPort := fmt.Sprintf("%s:%d", tg.Protocol, tg.Port)
-		lbCount := len(tg.LoadBalancers)
 		lbStr := "─"
-		if lbCount > 0 {
-			lbStr = fmt.Sprintf("%d attached", lbCount)
+		if len(tg.LoadBalancers) > 0 {
+			lbStr = fmt.Sprintf("%d attached", len(tg.LoadBalancers))
 		}
-
-		v.tgTable.SetCell(row, 0, tview.NewTableCell(" "+tg.Name).SetTextColor(tcell.ColorWhite))
+		v.tgTable.SetCell(row, 0, tview.NewTableCell(" "+tg.Name).
+			SetTextColor(tcell.ColorWhite).SetReference(&v.tgs[i]))
 		v.tgTable.SetCell(row, 1, tview.NewTableCell(" "+protoPort).SetTextColor(tcell.ColorAqua))
 		v.tgTable.SetCell(row, 2, tview.NewTableCell(" "+tg.TargetType).SetTextColor(tcell.ColorDarkGray))
 		v.tgTable.SetCell(row, 3, tview.NewTableCell(" "+orDash(tg.VpcID)).SetTextColor(tcell.ColorDarkGray))
 		v.tgTable.SetCell(row, 4, tview.NewTableCell(fmt.Sprintf("  %d/%d %s", healthy, total, theme.HealthBar(healthy, total))).
 			SetTextColor(hColor))
 		v.tgTable.SetCell(row, 5, tview.NewTableCell(" "+lbStr).SetTextColor(tcell.ColorDarkGray))
+		row++
 	}
-	if len(v.tgs) == 0 {
-		v.tgTable.SetCell(1, 0, tview.NewTableCell("  No target groups found").
-			SetTextColor(tcell.ColorDarkGray).SetSelectable(false))
+	if row == 1 {
+		msg := "  No target groups found"
+		if v.filter != "" {
+			msg = fmt.Sprintf("  No results for \"%s\"  [Esc to clear]", v.filter)
+		}
+		v.tgTable.SetCell(1, 0, tview.NewTableCell(msg).SetTextColor(tcell.ColorDarkGray).SetSelectable(false))
 	}
+}
+
+func (v *TGView) openTGFilter() {
+	input := tview.NewInputField().
+		SetLabel("  / Filter: ").
+		SetFieldWidth(30).
+		SetText(v.filter).
+		SetFieldTextColor(tcell.ColorWhite).
+		SetFieldBackgroundColor(tcell.ColorDarkSlateBlue)
+	input.SetDoneFunc(func(key tcell.Key) {
+		if key == tcell.KeyEnter {
+			v.filter = input.GetText()
+		} else {
+			v.filter = ""
+		}
+		v.pages.RemovePage("filter")
+		v.app.SetFocus(v.tgTable)
+		v.updateTGTable()
+	})
+	filterLayout := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(v.tgTable, 0, 1, false).
+		AddItem(input, 1, 0, true)
+	v.pages.AddAndSwitchToPage("filter", filterLayout, true)
+	v.app.SetFocus(input)
 }
 
 func (v *TGView) openHealthMonitor(tg aws.TargetGroup) {

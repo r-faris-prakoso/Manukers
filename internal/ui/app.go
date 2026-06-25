@@ -384,8 +384,14 @@ func (a *App) executeCommand(cmd string) {
 
 func (a *App) setupGlobalInput() {
 	a.tviewApp.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		// While command bar is open pass everything to it.
+		// While the command bar is open, pass everything through.
 		if a.cmdVisible {
+			return event
+		}
+		// While any InputField is focused (e.g. the / filter bar in any view),
+		// pass everything through so the user can type freely — including 'r',
+		// 'q', ':', etc. — without triggering global shortcuts.
+		if _, isInput := a.tviewApp.GetFocus().(*tview.InputField); isInput {
 			return event
 		}
 

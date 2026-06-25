@@ -17,9 +17,11 @@ type LBView struct {
 	app    *tview.Application
 	client *aws.Client
 
-	pages   *tview.Pages
-	lbTable *tview.Table
-	lbs     []aws.LoadBalancer
+	pages          *tview.Pages
+	lbTable        *tview.Table
+	listenersTable *tview.Table // stored so openRules can focus it on Esc
+	lbs            []aws.LoadBalancer
+	filter         string
 }
 
 func NewLBView(app *tview.Application, client *aws.Client) *LBView {
@@ -28,12 +30,21 @@ func NewLBView(app *tview.Application, client *aws.Client) *LBView {
 		client: client,
 		pages:  tview.NewPages(),
 	}
-	v.lbTable = newStyledTable(" Load Balancers  <Enter> Listeners ")
+	v.lbTable = newStyledTable(" Load Balancers  <Enter> Listeners  </> Filter ")
+	// Use cell reference so selection works correctly even when rows are filtered.
 	v.lbTable.SetSelectedFunc(func(row, col int) {
-		if row > 0 && row <= len(v.lbs) {
-			// openListeners shows a loading page immediately — no blocking here.
-			v.openListeners(v.lbs[row-1])
+		cell := v.lbTable.GetCell(row, 0)
+		if cell == nil || cell.GetReference() == nil {
+			return
 		}
+		v.openListeners(*cell.GetReference().(*aws.LoadBalancer))
+	})
+	v.lbTable.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Rune() == '/' {
+			v.openFilter()
+			return nil
+		}
+		return event
 	})
 	v.pages.AddPage("list", v.lbTable, true, true)
 	return v
@@ -58,21 +69,56 @@ func (v *LBView) updateLBTable() {
 	for col, h := range []string{"NAME", "TYPE", "STATE", "SCHEME", "VPC", "DNS NAME"} {
 		v.lbTable.SetCell(0, col, headerCell(h))
 	}
-	for i, lb := range v.lbs {
-		row := i + 1
+	row := 1
+	for i := range v.lbs {
+		lb := v.lbs[i]
+		if v.filter != "" && !strings.Contains(strings.ToLower(lb.Name), strings.ToLower(v.filter)) {
+			continue
+		}
 		sc := theme.StateColor(lb.State)
 		icon := theme.StateIcon(lb.State)
-		v.lbTable.SetCell(row, 0, tview.NewTableCell(" "+lb.Name).SetTextColor(tcell.ColorWhite))
+		// Store a pointer to the LB in the first cell so SetSelectedFunc can
+		// retrieve the correct item regardless of how many rows are filtered.
+		v.lbTable.SetCell(row, 0, tview.NewTableCell(" "+lb.Name).
+			SetTextColor(tcell.ColorWhite).SetReference(&v.lbs[i]))
 		v.lbTable.SetCell(row, 1, tview.NewTableCell(" "+lb.Type).SetTextColor(tcell.ColorDarkGray))
 		v.lbTable.SetCell(row, 2, tview.NewTableCell(" "+icon+" "+lb.State).SetTextColor(sc))
 		v.lbTable.SetCell(row, 3, tview.NewTableCell(" "+lb.Scheme).SetTextColor(schemeColor(lb.Scheme)))
 		v.lbTable.SetCell(row, 4, tview.NewTableCell(" "+lb.VpcID).SetTextColor(tcell.ColorDarkGray))
 		v.lbTable.SetCell(row, 5, tview.NewTableCell(" "+lb.DNSName).SetTextColor(tcell.ColorDarkGray).SetMaxWidth(50))
+		row++
 	}
-	if len(v.lbs) == 0 {
-		v.lbTable.SetCell(1, 0, tview.NewTableCell("  No load balancers found").
-			SetTextColor(tcell.ColorDarkGray).SetSelectable(false))
+	if row == 1 {
+		msg := "  No load balancers found"
+		if v.filter != "" {
+			msg = fmt.Sprintf("  No results for \"%s\"  [Esc to clear]", v.filter)
+		}
+		v.lbTable.SetCell(1, 0, tview.NewTableCell(msg).SetTextColor(tcell.ColorDarkGray).SetSelectable(false))
 	}
+}
+
+func (v *LBView) openFilter() {
+	input := tview.NewInputField().
+		SetLabel("  / Filter: ").
+		SetFieldWidth(30).
+		SetText(v.filter).
+		SetFieldTextColor(tcell.ColorWhite).
+		SetFieldBackgroundColor(tcell.ColorDarkSlateBlue)
+	input.SetDoneFunc(func(key tcell.Key) {
+		if key == tcell.KeyEnter {
+			v.filter = input.GetText()
+		} else {
+			v.filter = ""
+		}
+		v.pages.RemovePage("filter")
+		v.app.SetFocus(v.lbTable)
+		v.updateLBTable()
+	})
+	filterLayout := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(v.lbTable, 0, 1, false).
+		AddItem(input, 1, 0, true)
+	v.pages.AddAndSwitchToPage("filter", filterLayout, true)
+	v.app.SetFocus(input)
 }
 
 // openListeners shows a loading page instantly, then fetches in the background.
@@ -120,7 +166,9 @@ func (v *LBView) openListeners(lb aws.LoadBalancer) {
 		}
 
 		// Step 3: swap loading page → real table on the main loop.
+		// Also save the table so openRules can restore focus on Esc.
 		v.app.QueueUpdateDraw(func() {
+			v.listenersTable = table
 			v.pages.AddAndSwitchToPage("listeners", table, true)
 			v.app.SetFocus(table)
 		})
@@ -128,16 +176,16 @@ func (v *LBView) openListeners(lb aws.LoadBalancer) {
 }
 
 // openRules shows a loading page instantly, then fetches in the background.
+// Called from SetSelectedFunc which runs on the main loop — never use
+// QueueUpdateDraw here for the initial setup; call tview methods directly.
 func (v *LBView) openRules(lb aws.LoadBalancer, listener aws.Listener) {
-	// Step 1: instant loading page.
+	// Step 1: instant loading page — direct calls, we are on the main loop.
 	title := fmt.Sprintf(" Rules: %s :%d ", lb.Name, listener.Port)
 	loading := loadingText(title)
-	loading.SetInputCapture(escBack(v.app, v.pages, "listeners", nil))
-
-	v.app.QueueUpdateDraw(func() {
-		v.pages.AddAndSwitchToPage("rules", loading, true)
-		v.app.SetFocus(loading)
-	})
+	// Pass listenersTable so Esc correctly refocuses the listeners list.
+	loading.SetInputCapture(escBack(v.app, v.pages, "listeners", v.listenersTable))
+	v.pages.AddAndSwitchToPage("rules", loading, true)
+	v.app.SetFocus(loading)
 
 	// Step 2: fetch in background.
 	go func() {
