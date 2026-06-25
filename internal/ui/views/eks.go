@@ -79,24 +79,34 @@ func (v *EKSView) updateEKSTable() {
 }
 
 func (v *EKSView) openClusterDetail(cl aws.EKSCluster) {
-	ctx := context.Background()
-	var (
-		nodeGroups []aws.NodeGroup
-		addons     []aws.Addon
-		wg         sync.WaitGroup
-	)
-	wg.Add(2)
-	go func() { defer wg.Done(); nodeGroups, _ = v.client.ListNodeGroups(ctx, cl.Name) }()
-	go func() { defer wg.Done(); addons, _ = v.client.ListAddons(ctx, cl.Name) }()
-	wg.Wait()
+	// Step 1: show loading page instantly — no blocking.
+	loading := loadingText(fmt.Sprintf(" Cluster: %s ", cl.Name))
+	loading.SetInputCapture(escBack(v.app, v.pages, "list", v.eksTable))
+	v.pages.AddAndSwitchToPage("detail", loading, true)
+	v.app.SetFocus(loading)
 
-	tv := tview.NewTextView().
-		SetDynamicColors(true).
-		SetScrollable(true)
-	tv.SetBorder(true).
-		SetTitle(fmt.Sprintf(" Cluster: %s  <Esc> Back ", cl.Name))
-	tv.SetInputCapture(escBack(v.app, v.pages, "list", v.eksTable))
+	// Step 2: fetch node groups + add-ons concurrently without blocking the main loop.
+	go func() {
+		ctx := context.Background()
+		var (
+			nodeGroups []aws.NodeGroup
+			addons     []aws.Addon
+			wg         sync.WaitGroup
+		)
+		wg.Add(2)
+		go func() { defer wg.Done(); nodeGroups, _ = v.client.ListNodeGroups(ctx, cl.Name) }()
+		go func() { defer wg.Done(); addons, _ = v.client.ListAddons(ctx, cl.Name) }()
+		wg.Wait()
 
+		text := buildClusterText(cl, nodeGroups, addons)
+		v.app.QueueUpdateDraw(func() {
+			loading.SetTitle(fmt.Sprintf(" Cluster: %s  <Esc> Back ", cl.Name))
+			loading.SetText(text)
+		})
+	}()
+}
+
+func buildClusterText(cl aws.EKSCluster, nodeGroups []aws.NodeGroup, addons []aws.Addon) string {
 	sc := theme.StateColorName(cl.Status)
 
 	text := fmt.Sprintf("[aqua::b]  %s[-:-:-]\n\n", cl.Name)
@@ -110,7 +120,6 @@ func (v *EKSView) openClusterDetail(cl aws.EKSCluster) {
 	if !cl.CreatedAt.IsZero() {
 		text += fmt.Sprintf("  [yellow]Created  [-][white]%s[-]\n", cl.CreatedAt.Format("2006-01-02 15:04:05"))
 	}
-
 	if len(cl.Tags) > 0 {
 		text += "\n  [yellow::b]Tags[-:-:-]\n"
 		for k, val := range cl.Tags {
@@ -118,7 +127,6 @@ func (v *EKSView) openClusterDetail(cl aws.EKSCluster) {
 		}
 	}
 
-	// Node Groups
 	text += "\n  [yellow::b]Node Groups[-:-:-]\n"
 	if len(nodeGroups) == 0 {
 		text += "  [darkgray]  (none)[-]\n"
@@ -132,7 +140,6 @@ func (v *EKSView) openClusterDetail(cl aws.EKSCluster) {
 			ng.DesiredSize, ng.MinSize, ng.MaxSize)
 	}
 
-	// Add-ons
 	text += "\n  [yellow::b]Add-ons[-:-:-]\n"
 	if len(addons) == 0 {
 		text += "  [darkgray]  (none)[-]\n"
@@ -144,8 +151,5 @@ func (v *EKSView) openClusterDetail(cl aws.EKSCluster) {
 	}
 
 	text += "\n  [darkgray][Esc] Back[-]"
-	tv.SetText(text)
-
-	v.pages.AddAndSwitchToPage("detail", tv, true)
-	v.app.SetFocus(tv)
+	return text
 }

@@ -2,11 +2,9 @@ package ui
 
 import (
 	"context"
-	"fmt"
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -18,176 +16,233 @@ import (
 // ─── View IDs ────────────────────────────────────────────────────────────────
 
 const (
-	viewOverview = "overview"
-	viewEC2      = "ec2"
-	viewLB       = "lb"
-	viewTG       = "tg"
-	viewSG       = "sg"
-	viewEKS      = "eks"
-	viewGraph    = "graph"
-	viewECR      = "ecr"
-	viewS3       = "s3"
+	viewEC2   = "ec2"
+	viewLB    = "lb"
+	viewTG    = "tg"
+	viewSG    = "sg"
+	viewEKS   = "eks"
+	viewGraph = "graph"
+	viewECR   = "ecr"
+	viewS3    = "s3"
 
-	// cacheTTL: data older than this is considered stale and will be
-	// refreshed lazily the next time the view is activated.
-	cacheTTL = 30 * time.Second
+	pagePicker   = "picker"
+	pageResource = "resource" // wraps all resource views
 )
 
-// commandAliases maps typed `:commands` to view IDs.
+// commandAliases maps `:cmd` strings to view IDs.
 var commandAliases = map[string]string{
-	"overview":       viewOverview,
-	"home":           viewOverview,
-	"ec2":            viewEC2,
-	"instances":      viewEC2,
-	"lb":             viewLB,
-	"loadbalancer":   viewLB,
-	"loadbalancers":  viewLB,
-	"alb":            viewLB,
-	"nlb":            viewLB,
-	"tg":             viewTG,
-	"targetgroup":    viewTG,
-	"targetgroups":   viewTG,
-	"sg":             viewSG,
-	"securitygroup":  viewSG,
-	"securitygroups": viewSG,
-	"eks":            viewEKS,
-	"k8s":            viewEKS,
-	"kubernetes":     viewEKS,
-	"graph":          viewGraph,
-	"connection":     viewGraph,
-	"ecr":            viewECR,
-	"registry":       viewECR,
-	"repositories":   viewECR,
-	"s3":             viewS3,
-	"buckets":        viewS3,
-	"storage":        viewS3,
-}
-
-// refreshable is implemented by every view.
-type refreshable interface {
-	Refresh(ctx context.Context)
+	"ec2": viewEC2, "instances": viewEC2,
+	"lb": viewLB, "loadbalancer": viewLB, "loadbalancers": viewLB, "alb": viewLB, "nlb": viewLB,
+	"tg": viewTG, "targetgroup": viewTG, "targetgroups": viewTG,
+	"sg": viewSG, "securitygroup": viewSG, "securitygroups": viewSG,
+	"eks": viewEKS, "k8s": viewEKS, "kubernetes": viewEKS,
+	"graph": viewGraph, "connection": viewGraph,
+	"ecr": viewECR, "registry": viewECR, "repositories": viewECR,
+	"s3": viewS3, "buckets": viewS3, "storage": viewS3,
 }
 
 // App is the main TUI application.
 type App struct {
-	tviewApp    *tview.Application
-	layout      *tview.Flex
-	header      *tview.TextView
-	navBar      *tview.TextView
-	mainContent *tview.Pages
-	footer      *tview.TextView
+	tviewApp *tview.Application
 
-	// Command bar
-	cmdArea    *tview.Pages
+	// Root page stack: picker OR resource view.
+	pages        *tview.Pages
+	resourcePages *tview.Pages // holds the individual resource views
+
+	// Command bar (shown over the footer area).
 	cmdInput   *tview.InputField
 	cmdHint    *tview.TextView
+	cmdArea    *tview.Pages
 	cmdVisible bool
 
 	client      *aws.Client
-	currentView string
+	currentView string // which resource is active inside resourcePages
 
-	overviewView *views.OverviewView
-	ec2View      *views.EC2View
-	lbView       *views.LBView
-	tgView       *views.TGView
-	sgView       *views.SGView
-	eksView      *views.EKSView
-	graphView    *views.GraphView
-	ecrView      *views.ECRView
-	s3View       *views.S3View
+	pickerView  *views.PickerView
+	overviewView *views.OverviewView // kept for completeness; not in picker
+	ec2View     *views.EC2View
+	lbView      *views.LBView
+	tgView      *views.TGView
+	sgView      *views.SGView
+	eksView     *views.EKSView
+	graphView   *views.GraphView
+	ecrView     *views.ECRView
+	s3View      *views.S3View
 
-	// Per-view lazy-load cache.  Protected by mu.
-	viewFetched  map[string]time.Time // last successful fetch time
-	viewFetching map[string]bool      // fetch in progress?
-
-	lastRefresh time.Time
-	mu          sync.Mutex
+	// Per-view fetch tracking (load once, manual refresh via r).
+	// No auto-refresh — API calls only happen on explicit user action.
+	viewFetched  map[string]bool
+	viewFetching map[string]bool
+	mu           sync.Mutex
 }
 
-// NewApp creates and initializes the TUI application.
+// NewApp creates and initialises the application.  No AWS calls are made here.
 func NewApp(client *aws.Client) *App {
 	a := &App{
 		tviewApp:     tview.NewApplication(),
-		mainContent:  tview.NewPages(),
+		pages:        tview.NewPages(),
+		resourcePages: tview.NewPages(),
 		cmdArea:      tview.NewPages(),
 		client:       client,
-		currentView:  viewEC2,
-		viewFetched:  make(map[string]time.Time),
+		viewFetched:  make(map[string]bool),
 		viewFetching: make(map[string]bool),
 	}
 
-	a.buildViews()
+	a.buildResourceViews()
 	a.buildLayout()
-	a.setupInput()
-	a.updateHeader()
-	a.updateNavBar()
-
-	// Lazy-load only the starting view; everything else loads on demand.
-	go a.loadView(viewEC2, false)
-
-	// Auto-refresh: revisit the current view every 30 s.
-	// loadView respects cacheTTL so it is a no-op if data is fresh.
-	go func() {
-		ticker := time.NewTicker(cacheTTL)
-		defer ticker.Stop()
-		for range ticker.C {
-			go a.loadView(a.currentView, false)
-		}
-	}()
+	a.setupGlobalInput()
 
 	return a
 }
 
-// Run starts the event loop.
 func (a *App) Run() error {
 	return a.tviewApp.Run()
 }
 
-// ─── Lazy loading ────────────────────────────────────────────────────────────
+// ─── Layout ──────────────────────────────────────────────────────────────────
 
-// loadView loads a view's data if it is stale or not yet fetched.
-// Pass force=true to bypass the cache (e.g. when the user presses r).
-func (a *App) loadView(id string, force bool) {
+func (a *App) buildResourceViews() {
+	a.overviewView = views.NewOverviewView(a.tviewApp, a.client)
+	a.ec2View = views.NewEC2View(a.tviewApp, a.client)
+	a.lbView = views.NewLBView(a.tviewApp, a.client)
+	a.tgView = views.NewTGView(a.tviewApp, a.client)
+	a.sgView = views.NewSGView(a.tviewApp, a.client)
+	a.eksView = views.NewEKSView(a.tviewApp, a.client)
+	a.graphView = views.NewGraphView(a.tviewApp, a.client)
+	a.ecrView = views.NewECRView(a.tviewApp, a.client)
+	a.s3View = views.NewS3View(a.tviewApp, a.client)
+
+	a.resourcePages.AddPage(viewEC2, a.ec2View.GetContent(), true, false)
+	a.resourcePages.AddPage(viewLB, a.lbView.GetContent(), true, false)
+	a.resourcePages.AddPage(viewTG, a.tgView.GetContent(), true, false)
+	a.resourcePages.AddPage(viewSG, a.sgView.GetContent(), true, false)
+	a.resourcePages.AddPage(viewEKS, a.eksView.GetContent(), true, false)
+	a.resourcePages.AddPage(viewGraph, a.graphView.GetContent(), true, false)
+	a.resourcePages.AddPage(viewECR, a.ecrView.GetContent(), true, false)
+	a.resourcePages.AddPage(viewS3, a.s3View.GetContent(), true, false)
+}
+
+func (a *App) buildLayout() {
+	// Picker — shown first, no AWS calls.
+	a.pickerView = views.NewPickerView(a.tviewApp, a.client.Region, func(viewID string) {
+		a.openResource(viewID)
+	})
+
+	// Footer for the resource view area.
+	footer := tview.NewTextView().SetDynamicColors(true)
+	footer.SetBackgroundColor(tcell.ColorDarkSlateGray)
+	footer.SetText(
+		" [yellow]Esc[-] Back  [yellow]r[-] Refresh  [yellow]/[-] Filter  [yellow]:[- ]Command  [yellow]q[-] Quit",
+	)
+
+	// Command bar: hint + input (shown instead of footer when : is pressed).
+	a.cmdHint = tview.NewTextView().SetDynamicColors(true)
+	a.cmdHint.SetBackgroundColor(tcell.ColorDarkSlateGray)
+
+	a.cmdInput = tview.NewInputField().
+		SetLabel("[yellow:darkslategray:b]:[white:darkslategray:-]").
+		SetFieldBackgroundColor(tcell.ColorDarkSlateGray).
+		SetFieldTextColor(tcell.ColorWhite).
+		SetLabelColor(tcell.ColorYellow)
+	a.cmdInput.SetChangedFunc(func(text string) { a.updateCmdHint(text) })
+	a.cmdInput.SetDoneFunc(func(key tcell.Key) {
+		switch key {
+		case tcell.KeyEnter:
+			cmd := strings.TrimSpace(a.cmdInput.GetText())
+			a.cmdInput.SetText("")
+			a.hideCmd()
+			if cmd != "" {
+				a.executeCommand(cmd)
+			}
+		default: // Esc, Tab
+			a.cmdInput.SetText("")
+			a.hideCmd()
+		}
+	})
+
+	cmdLayout := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(a.cmdHint, 1, 0, false).
+		AddItem(a.cmdInput, 1, 0, true)
+
+	a.cmdArea.AddPage("footer", footer, true, true)
+	a.cmdArea.AddPage("command", cmdLayout, true, false)
+
+	// Resource view wrapper: content + bottom bar.
+	resourceLayout := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(a.resourcePages, 0, 1, true).
+		AddItem(a.cmdArea, 2, 0, false)
+
+	// Root pages: picker or resource layout.
+	a.pages.AddPage(pagePicker, a.pickerView.GetContent(), true, true)
+	a.pages.AddPage(pageResource, resourceLayout, true, false)
+
+	a.tviewApp.SetRoot(a.pages, true).SetFocus(a.pickerView.GetFocusable())
+}
+
+// ─── Navigation ──────────────────────────────────────────────────────────────
+
+// openResource switches to the resource view and lazily loads its data.
+// Navigation is always instant; the load happens in a background goroutine.
+func (a *App) openResource(viewID string) {
+	a.currentView = viewID
+	a.resourcePages.SwitchToPage(viewID)
+	a.pages.SwitchToPage(pageResource)
+	a.setFocus(viewID)
+	go a.loadOnce(viewID)
+}
+
+// goToPicker returns to the picker screen.  Cached data is retained.
+func (a *App) goToPicker() {
+	a.hideCmd()
+	a.pages.SwitchToPage(pagePicker)
+	a.tviewApp.SetFocus(a.pickerView.GetFocusable())
+}
+
+// loadOnce fetches data for a view only if it hasn't been loaded yet this
+// session.  Pressing r calls loadForce, which always re-fetches.
+func (a *App) loadOnce(id string) {
+	a.mu.Lock()
+	already := a.viewFetched[id]
+	fetching := a.viewFetching[id]
+	a.mu.Unlock()
+
+	if already || fetching {
+		return
+	}
+	a.doLoad(id)
+}
+
+func (a *App) loadForce(id string) {
+	a.mu.Lock()
+	if a.viewFetching[id] {
+		a.mu.Unlock()
+		return
+	}
+	a.mu.Unlock()
+	a.doLoad(id)
+}
+
+func (a *App) doLoad(id string) {
 	v := a.viewByID(id)
 	if v == nil {
 		return
 	}
-
-	a.mu.Lock()
-	fetching := a.viewFetching[id]
-	lastFetch := a.viewFetched[id]
-	a.mu.Unlock()
-
-	if fetching {
-		return // already in flight
-	}
-	if !force && !lastFetch.IsZero() && time.Since(lastFetch) < cacheTTL {
-		return // data is fresh
-	}
-
 	a.mu.Lock()
 	a.viewFetching[id] = true
 	a.mu.Unlock()
 
-	ctx := context.Background()
-	v.Refresh(ctx)
+	v.Refresh(context.Background())
 
 	a.mu.Lock()
-	a.viewFetched[id] = time.Now()
+	a.viewFetched[id] = true
 	a.viewFetching[id] = false
-	a.lastRefresh = time.Now()
 	a.mu.Unlock()
-
-	a.tviewApp.QueueUpdateDraw(func() {
-		a.updateHeader()
-	})
 }
 
-// viewByID returns the refreshable interface for a given view ID.
+type refreshable interface{ Refresh(ctx context.Context) }
+
 func (a *App) viewByID(id string) refreshable {
 	switch id {
-	case viewOverview:
-		return a.overviewView
 	case viewEC2:
 		return a.ec2View
 	case viewLB:
@@ -208,173 +263,82 @@ func (a *App) viewByID(id string) refreshable {
 	return nil
 }
 
-// ─── Layout ──────────────────────────────────────────────────────────────────
-
-func (a *App) buildViews() {
-	a.overviewView = views.NewOverviewView(a.tviewApp, a.client)
-	a.ec2View = views.NewEC2View(a.tviewApp, a.client)
-	a.lbView = views.NewLBView(a.tviewApp, a.client)
-	a.tgView = views.NewTGView(a.tviewApp, a.client)
-	a.sgView = views.NewSGView(a.tviewApp, a.client)
-	a.eksView = views.NewEKSView(a.tviewApp, a.client)
-	a.graphView = views.NewGraphView(a.tviewApp, a.client)
-	a.ecrView = views.NewECRView(a.tviewApp, a.client)
-	a.s3View = views.NewS3View(a.tviewApp, a.client)
-
-	a.mainContent.AddPage(viewOverview, a.overviewView.GetContent(), true, false)
-	a.mainContent.AddPage(viewEC2, a.ec2View.GetContent(), true, true)
-	a.mainContent.AddPage(viewLB, a.lbView.GetContent(), true, false)
-	a.mainContent.AddPage(viewTG, a.tgView.GetContent(), true, false)
-	a.mainContent.AddPage(viewSG, a.sgView.GetContent(), true, false)
-	a.mainContent.AddPage(viewEKS, a.eksView.GetContent(), true, false)
-	a.mainContent.AddPage(viewGraph, a.graphView.GetContent(), true, false)
-	a.mainContent.AddPage(viewECR, a.ecrView.GetContent(), true, false)
-	a.mainContent.AddPage(viewS3, a.s3View.GetContent(), true, false)
+func (a *App) setFocus(id string) {
+	switch id {
+	case viewEC2:
+		a.tviewApp.SetFocus(a.ec2View.GetFocusable())
+	case viewLB:
+		a.tviewApp.SetFocus(a.lbView.GetFocusable())
+	case viewTG:
+		a.tviewApp.SetFocus(a.tgView.GetFocusable())
+	case viewSG:
+		a.tviewApp.SetFocus(a.sgView.GetFocusable())
+	case viewEKS:
+		a.tviewApp.SetFocus(a.eksView.GetFocusable())
+	case viewGraph:
+		a.tviewApp.SetFocus(a.graphView.GetFocusable())
+	case viewECR:
+		a.tviewApp.SetFocus(a.ecrView.GetFocusable())
+	case viewS3:
+		a.tviewApp.SetFocus(a.s3View.GetFocusable())
+	}
 }
 
-func (a *App) buildLayout() {
-	a.header = tview.NewTextView().SetDynamicColors(true).SetTextAlign(tview.AlignLeft)
-	a.header.SetBackgroundColor(tcell.ColorDarkSlateBlue)
-
-	a.navBar = tview.NewTextView().SetDynamicColors(true).SetTextAlign(tview.AlignLeft)
-	a.navBar.SetBackgroundColor(tcell.ColorDarkSlateGray)
-
-	a.footer = tview.NewTextView().SetDynamicColors(true)
-	a.footer.SetBackgroundColor(tcell.ColorDarkSlateGray)
-	a.footer.SetText(
-		" [yellow]:[white]cmd  [yellow]1-9[white] switch  [yellow]Enter[white] select  " +
-			"[yellow]Esc[white] back  [yellow]/[white] filter  [yellow]r[white] refresh  [yellow]q[white] quit",
-	)
-
-	a.cmdHint = tview.NewTextView().SetDynamicColors(true)
-	a.cmdHint.SetBackgroundColor(tcell.ColorDarkSlateGray)
-
-	a.cmdInput = tview.NewInputField().
-		SetLabel("[yellow:darkslategray:b]:[white:darkslategray:-]").
-		SetFieldBackgroundColor(tcell.ColorDarkSlateGray).
-		SetFieldTextColor(tcell.ColorWhite).
-		SetLabelColor(tcell.ColorYellow)
-
-	a.cmdInput.SetChangedFunc(func(text string) {
-		a.updateCmdHint(text)
-	})
-	a.cmdInput.SetDoneFunc(func(key tcell.Key) {
-		switch key {
-		case tcell.KeyEnter:
-			cmd := strings.TrimSpace(a.cmdInput.GetText())
-			a.cmdInput.SetText("")
-			a.hideCommandBar()
-			if cmd != "" {
-				a.executeCommand(cmd)
-			}
-		case tcell.KeyEscape, tcell.KeyTab:
-			a.cmdInput.SetText("")
-			a.hideCommandBar()
-		}
-	})
-
-	cmdLayout := tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(a.cmdHint, 1, 0, false).
-		AddItem(a.cmdInput, 1, 0, true)
-
-	a.cmdArea.AddPage("footer", a.footer, true, true)
-	a.cmdArea.AddPage("command", cmdLayout, true, false)
-
-	a.layout = tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(a.header, 1, 0, false).
-		AddItem(a.navBar, 1, 0, false).
-		AddItem(a.mainContent, 0, 1, true).
-		AddItem(a.cmdArea, 2, 0, false)
-
-	a.tviewApp.SetRoot(a.layout, true)
-}
-
-func (a *App) updateHeader() {
-	a.mu.Lock()
-	lr := a.lastRefresh
-	a.mu.Unlock()
-
-	sync := "never"
-	if !lr.IsZero() {
-		sync = lr.Format("15:04:05")
-	}
-	a.header.SetText(fmt.Sprintf(
-		" [::b][aqua]MANUKERS[-:-:-]  [darkgray]region:[white] %s  [darkgray]last sync:[white] %s  [darkgray]cache: %s[-]",
-		a.client.Region, sync, cacheTTL,
-	))
-}
-
-func (a *App) updateNavBar() {
-	type entry struct{ shortcut, name, view string }
-	tabs := []entry{
-		{"1", "Overview", viewOverview},
-		{"2", "EC2", viewEC2},
-		{"3", "Load Balancers", viewLB},
-		{"4", "Target Groups", viewTG},
-		{"5", "Security Groups", viewSG},
-		{"6", "EKS", viewEKS},
-		{"7", "ECR", viewECR},
-		{"8", "S3", viewS3},
-		{"9", "Graph", viewGraph},
-	}
-	text := " "
-	for _, t := range tabs {
-		if t.view == a.currentView {
-			text += fmt.Sprintf("[black:aqua:b] %s: %s [-:-:-]  ", t.shortcut, t.name)
-		} else {
-			// Show a dot if data has been fetched for this view
-			a.mu.Lock()
-			fetched := !a.viewFetched[t.view].IsZero()
-			a.mu.Unlock()
-			dot := ""
-			if fetched {
-				dot = "[darkgray]·[-]"
-			}
-			text += fmt.Sprintf("[darkgray]<%s>[-] %s%s  ", t.shortcut, t.name, dot)
-		}
-	}
-	a.navBar.SetText(text)
+// isRootFocusable returns true when the focused primitive is the top-level
+// list of a resource view (not a drill-down detail).  Used to decide whether
+// Esc should return to the picker.
+func (a *App) isRootFocusable(prim tview.Primitive) bool {
+	return prim == a.ec2View.GetFocusable() ||
+		prim == a.lbView.GetFocusable() ||
+		prim == a.tgView.GetFocusable() ||
+		prim == a.sgView.GetFocusable() ||
+		prim == a.eksView.GetFocusable() ||
+		prim == a.graphView.GetFocusable() ||
+		prim == a.ecrView.GetFocusable() ||
+		prim == a.s3View.GetFocusable()
 }
 
 // ─── Command Bar ─────────────────────────────────────────────────────────────
 
-func (a *App) showCommandBar() {
+func (a *App) showCmd() {
 	a.cmdVisible = true
 	a.updateCmdHint("")
 	a.cmdArea.SwitchToPage("command")
 	a.tviewApp.SetFocus(a.cmdInput)
 }
 
-func (a *App) hideCommandBar() {
+func (a *App) hideCmd() {
 	a.cmdVisible = false
 	a.cmdArea.SwitchToPage("footer")
-	a.setFocusForView(a.currentView)
+	if a.currentView != "" {
+		a.setFocus(a.currentView)
+	} else {
+		a.tviewApp.SetFocus(a.pickerView.GetFocusable())
+	}
 }
 
 func (a *App) updateCmdHint(typed string) {
-	all := allCommandKeys()
+	keys := allCmdKeys()
 	typed = strings.ToLower(typed)
-
 	var matches, rest []string
-	for _, k := range all {
+	for _, k := range keys {
 		if typed == "" || strings.HasPrefix(k, typed) {
 			matches = append(matches, k)
 		} else {
 			rest = append(rest, k)
 		}
 	}
-
 	hint := " "
 	for _, m := range matches {
-		hint += fmt.Sprintf("[aqua]%s[-]  ", m)
+		hint += "[aqua]" + m + "[-]  "
 	}
 	for _, r := range rest {
-		hint += fmt.Sprintf("[darkgray]%s[-]  ", r)
+		hint += "[darkgray]" + r + "[-]  "
 	}
 	a.cmdHint.SetText(hint)
 }
 
-func allCommandKeys() []string {
+func allCmdKeys() []string {
 	seen := map[string]bool{}
 	var keys []string
 	for k := range commandAliases {
@@ -393,107 +357,65 @@ func (a *App) executeCommand(cmd string) {
 		a.tviewApp.Stop()
 		return
 	}
-	if view, ok := commandAliases[cmd]; ok {
-		a.switchTo(view)
+	if cmd == "back" || cmd == "picker" || cmd == "home" {
+		a.goToPicker()
 		return
 	}
-	// Prefix match — pick shortest
+	// Exact match
+	if id, ok := commandAliases[cmd]; ok {
+		a.openResource(id)
+		return
+	}
+	// Prefix match — shortest alias wins
 	var best string
-	for alias, view := range commandAliases {
+	for alias, id := range commandAliases {
 		if strings.HasPrefix(alias, cmd) {
 			if best == "" || len(alias) < len(best) {
-				best = view
+				best = id
 			}
 		}
 	}
 	if best != "" {
-		a.switchTo(best)
+		a.openResource(best)
 	}
 }
 
-// ─── Input Handling ───────────────────────────────────────────────────────────
+// ─── Global Input ─────────────────────────────────────────────────────────────
 
-func (a *App) setupInput() {
+func (a *App) setupGlobalInput() {
 	a.tviewApp.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		// While command bar is open pass everything to it.
 		if a.cmdVisible {
 			return event
 		}
+
 		switch event.Rune() {
-		case ':':
-			a.showCommandBar()
-			return nil
 		case 'q', 'Q':
 			a.tviewApp.Stop()
 			return nil
+
+		case ':':
+			a.showCmd()
+			return nil
+
 		case 'r', 'R':
-			// Force-refresh current view (bypass cache)
-			go a.loadView(a.currentView, true)
-			return nil
-		case '1':
-			a.switchTo(viewOverview)
-			return nil
-		case '2':
-			a.switchTo(viewEC2)
-			return nil
-		case '3':
-			a.switchTo(viewLB)
-			return nil
-		case '4':
-			a.switchTo(viewTG)
-			return nil
-		case '5':
-			a.switchTo(viewSG)
-			return nil
-		case '6':
-			a.switchTo(viewEKS)
-			return nil
-		case '7':
-			a.switchTo(viewECR)
-			return nil
-		case '8':
-			a.switchTo(viewS3)
-			return nil
-		case '9':
-			a.switchTo(viewGraph)
+			// Force-reload the active resource (bypass the "already loaded" flag).
+			if a.currentView != "" {
+				go a.loadForce(a.currentView)
+			}
 			return nil
 		}
+
+		// Esc: if focus is on the root list of a resource view, go back to
+		// the picker.  Otherwise let the view handle its own Esc (e.g. detail
+		// → list transitions).
+		if event.Key() == tcell.KeyEscape {
+			if a.isRootFocusable(a.tviewApp.GetFocus()) {
+				a.goToPicker()
+				return nil
+			}
+		}
+
 		return event
 	})
-}
-
-// switchTo changes the active page instantly, then triggers a lazy data load
-// in the background.  Navigation is always immediate regardless of network.
-func (a *App) switchTo(view string) {
-	a.currentView = view
-	// Page switch is synchronous — happens before any network I/O.
-	a.mainContent.SwitchToPage(view)
-	a.tviewApp.QueueUpdateDraw(func() {
-		a.updateNavBar()
-		a.setFocusForView(view)
-	})
-	// Load data in background; no-op if cache is still fresh.
-	go a.loadView(view, false)
-}
-
-func (a *App) setFocusForView(view string) {
-	switch view {
-	case viewOverview:
-		a.tviewApp.SetFocus(a.overviewView.GetFocusable())
-	case viewEC2:
-		a.tviewApp.SetFocus(a.ec2View.GetFocusable())
-	case viewLB:
-		a.tviewApp.SetFocus(a.lbView.GetFocusable())
-	case viewTG:
-		a.tviewApp.SetFocus(a.tgView.GetFocusable())
-	case viewSG:
-		a.tviewApp.SetFocus(a.sgView.GetFocusable())
-	case viewEKS:
-		a.tviewApp.SetFocus(a.eksView.GetFocusable())
-	case viewGraph:
-		a.tviewApp.SetFocus(a.graphView.GetFocusable())
-	case viewECR:
-		a.tviewApp.SetFocus(a.ecrView.GetFocusable())
-	case viewS3:
-		a.tviewApp.SetFocus(a.s3View.GetFocusable())
-	}
 }

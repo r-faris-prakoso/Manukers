@@ -17,11 +17,9 @@ type LBView struct {
 	app    *tview.Application
 	client *aws.Client
 
-	pages    *tview.Pages
-	lbTable  *tview.Table
-	lbs      []aws.LoadBalancer
-
-	selectedLB *aws.LoadBalancer
+	pages   *tview.Pages
+	lbTable *tview.Table
+	lbs     []aws.LoadBalancer
 }
 
 func NewLBView(app *tview.Application, client *aws.Client) *LBView {
@@ -33,6 +31,7 @@ func NewLBView(app *tview.Application, client *aws.Client) *LBView {
 	v.lbTable = newStyledTable(" Load Balancers  <Enter> Listeners ")
 	v.lbTable.SetSelectedFunc(func(row, col int) {
 		if row > 0 && row <= len(v.lbs) {
+			// openListeners shows a loading page immediately — no blocking here.
 			v.openListeners(v.lbs[row-1])
 		}
 	})
@@ -63,12 +62,6 @@ func (v *LBView) updateLBTable() {
 		row := i + 1
 		sc := theme.StateColor(lb.State)
 		icon := theme.StateIcon(lb.State)
-		scheme := lb.Scheme
-		if scheme == "internet-facing" {
-			scheme = "[aqua]internet-facing[-]"
-		} else {
-			scheme = "[darkgray]internal[-]"
-		}
 		v.lbTable.SetCell(row, 0, tview.NewTableCell(" "+lb.Name).SetTextColor(tcell.ColorWhite))
 		v.lbTable.SetCell(row, 1, tview.NewTableCell(" "+lb.Type).SetTextColor(tcell.ColorDarkGray))
 		v.lbTable.SetCell(row, 2, tview.NewTableCell(" "+icon+" "+lb.State).SetTextColor(sc))
@@ -82,62 +75,103 @@ func (v *LBView) updateLBTable() {
 	}
 }
 
+// openListeners shows a loading page instantly, then fetches in the background.
+// This must never block the main event loop.
 func (v *LBView) openListeners(lb aws.LoadBalancer) {
-	ctx := context.Background()
-	listeners, err := v.client.GetListeners(ctx, lb.ARN)
-	if err != nil {
-		return
-	}
+	// Step 1: show loading page with zero API calls — instant.
+	loading := loadingText(fmt.Sprintf(" Listeners: %s ", lb.Name))
+	loading.SetInputCapture(escBack(v.app, v.pages, "list", v.lbTable))
+	v.pages.AddAndSwitchToPage("listeners", loading, true)
+	v.app.SetFocus(loading)
 
-	table := newStyledTable(fmt.Sprintf(" Listeners: %s  <Enter> Rules  <Esc> Back ", lb.Name))
-	table.SetSelectedFunc(func(row, col int) {
-		if row > 0 && row <= len(listeners) {
-			v.openRules(lb, listeners[row-1])
+	// Step 2: fetch in background goroutine.
+	go func() {
+		ctx := context.Background()
+		listeners, err := v.client.GetListeners(ctx, lb.ARN)
+		if err != nil {
+			v.app.QueueUpdateDraw(func() {
+				loading.SetText(fmt.Sprintf("  [red]Error: %s[-]", err))
+			})
+			return
 		}
-	})
-	table.SetInputCapture(escBack(v.app, v.pages, "list", v.lbTable))
 
-	for col, h := range []string{"PORT", "PROTOCOL", "SSL POLICY", "RULES"} {
-		table.SetCell(0, col, headerCell(h))
-	}
-	for i, l := range listeners {
-		row := i + 1
-		table.SetCell(row, 0, tview.NewTableCell(fmt.Sprintf(" %d", l.Port)).SetTextColor(tcell.ColorAqua))
-		table.SetCell(row, 1, tview.NewTableCell(" "+l.Protocol).SetTextColor(tcell.ColorWhite))
-		table.SetCell(row, 2, tview.NewTableCell(" "+orDash(l.SSLPolicy)).SetTextColor(tcell.ColorDarkGray))
-		table.SetCell(row, 3, tview.NewTableCell("  → press Enter to view").SetTextColor(tcell.ColorDarkGray))
-	}
+		// Build the real table (tview primitive creation is goroutine-safe
+		// as long as the primitive isn't yet attached to the screen).
+		table := newStyledTable(fmt.Sprintf(" Listeners: %s  <Enter> Rules  <Esc> Back ", lb.Name))
+		table.SetInputCapture(escBack(v.app, v.pages, "list", v.lbTable))
+		table.SetSelectedFunc(func(row, col int) {
+			if row > 0 && row <= len(listeners) {
+				// openRules also shows loading instantly.
+				v.openRules(lb, listeners[row-1])
+			}
+		})
+		for col, h := range []string{"PORT", "PROTOCOL", "SSL POLICY"} {
+			table.SetCell(0, col, headerCell(h))
+		}
+		for i, l := range listeners {
+			row := i + 1
+			table.SetCell(row, 0, tview.NewTableCell(fmt.Sprintf(" %d", l.Port)).SetTextColor(tcell.ColorAqua))
+			table.SetCell(row, 1, tview.NewTableCell(" "+l.Protocol).SetTextColor(tcell.ColorWhite))
+			table.SetCell(row, 2, tview.NewTableCell(" "+orDash(l.SSLPolicy)).SetTextColor(tcell.ColorDarkGray))
+		}
+		if len(listeners) == 0 {
+			table.SetCell(1, 0, tview.NewTableCell("  No listeners found").
+				SetTextColor(tcell.ColorDarkGray).SetSelectable(false))
+		}
 
-	v.pages.AddAndSwitchToPage("listeners", table, true)
-	v.app.SetFocus(table)
+		// Step 3: swap loading page → real table on the main loop.
+		v.app.QueueUpdateDraw(func() {
+			v.pages.AddAndSwitchToPage("listeners", table, true)
+			v.app.SetFocus(table)
+		})
+	}()
 }
 
+// openRules shows a loading page instantly, then fetches in the background.
 func (v *LBView) openRules(lb aws.LoadBalancer, listener aws.Listener) {
-	ctx := context.Background()
-	rules, err := v.client.GetRules(ctx, listener.ARN)
-	if err != nil {
-		return
-	}
+	// Step 1: instant loading page.
+	title := fmt.Sprintf(" Rules: %s :%d ", lb.Name, listener.Port)
+	loading := loadingText(title)
+	loading.SetInputCapture(escBack(v.app, v.pages, "listeners", nil))
 
-	tv := tview.NewTextView().
-		SetDynamicColors(true).
-		SetScrollable(true)
-	tv.SetBorder(true).
-		SetTitle(fmt.Sprintf(" Rules: %s :%d  <Esc> Back ", lb.Name, listener.Port))
-	tv.SetInputCapture(escBack(v.app, v.pages, "listeners", nil))
+	v.app.QueueUpdateDraw(func() {
+		v.pages.AddAndSwitchToPage("rules", loading, true)
+		v.app.SetFocus(loading)
+	})
 
+	// Step 2: fetch in background.
+	go func() {
+		ctx := context.Background()
+		rules, err := v.client.GetRules(ctx, listener.ARN)
+		if err != nil {
+			v.app.QueueUpdateDraw(func() {
+				loading.SetText(fmt.Sprintf("  [red]Error: %s[-]", err))
+			})
+			return
+		}
+
+		text := buildRulesText(lb, listener, rules)
+
+		v.app.QueueUpdateDraw(func() {
+			loading.SetTitle(fmt.Sprintf(" Rules: %s :%d  <Esc> Back ", lb.Name, listener.Port))
+			loading.SetText(text)
+		})
+	}()
+}
+
+// ─── Text builders ────────────────────────────────────────────────────────────
+
+func buildRulesText(lb aws.LoadBalancer, listener aws.Listener, rules []aws.Rule) string {
 	text := fmt.Sprintf("[aqua::b]%s  Port %d / %s[-:-:-]\n\n", lb.Name, listener.Port, listener.Protocol)
 	if listener.SSLPolicy != "" {
 		text += fmt.Sprintf("[darkgray]SSL Policy: %s[-]\n\n", listener.SSLPolicy)
 	}
-
 	for _, rule := range rules {
 		pri := rule.Priority
 		if rule.IsDefault {
 			pri = "default"
 		}
 		text += fmt.Sprintf("[yellow::b]Priority: %s[-:-:-]\n", pri)
-
 		if len(rule.Conditions) > 0 {
 			text += "  [darkgray]Conditions:[-]\n"
 			for _, cond := range rule.Conditions {
@@ -145,7 +179,6 @@ func (v *LBView) openRules(lb aws.LoadBalancer, listener aws.Listener) {
 					cond.Field, strings.Join(cond.Values, ", "))
 			}
 		}
-
 		if len(rule.Actions) > 0 {
 			text += "  [darkgray]Actions:[-]\n"
 			for _, action := range rule.Actions {
@@ -176,13 +209,19 @@ func (v *LBView) openRules(lb aws.LoadBalancer, listener aws.Listener) {
 		}
 		text += "\n"
 	}
-
-	tv.SetText(text)
-	v.pages.AddAndSwitchToPage("rules", tv, true)
-	v.app.SetFocus(tv)
+	return text
 }
 
-// ─── Helpers shared across views ─────────────────────────────────────────────
+// ─── Shared helpers ───────────────────────────────────────────────────────────
+
+// loadingText returns a styled TextView showing "Loading…" that can be swapped
+// out for the real content once the background fetch completes.
+func loadingText(title string) *tview.TextView {
+	tv := tview.NewTextView().SetDynamicColors(true).SetScrollable(true)
+	tv.SetBorder(true).SetTitle(title)
+	tv.SetText("  [darkgray]Loading…[-]")
+	return tv
+}
 
 func newStyledTable(title string) *tview.Table {
 	t := tview.NewTable()

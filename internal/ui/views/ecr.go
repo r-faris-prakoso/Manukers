@@ -14,12 +14,11 @@ import (
 
 // ECRView shows ECR repositories with drill-down into images.
 type ECRView struct {
-	app    *tview.Application
-	client *aws.Client
-
-	pages    *tview.Pages
+	app       *tview.Application
+	client    *aws.Client
+	pages     *tview.Pages
 	repoTable *tview.Table
-	repos    []aws.ECRRepository
+	repos     []aws.ECRRepository
 }
 
 func NewECRView(app *tview.Application, client *aws.Client) *ECRView {
@@ -69,15 +68,15 @@ func (v *ECRView) updateRepoTable() {
 		if !repo.CreatedAt.IsZero() {
 			created = repo.CreatedAt.Format("2006-01-02")
 		}
-		v.repoTable.SetCell(row, 0, tview.NewTableCell(" "+repo.Name).SetTextColor(tcell.ColorWhite))
-		v.repoTable.SetCell(row, 1, tview.NewTableCell(" "+repo.URI).SetTextColor(tcell.ColorDarkGray).SetMaxWidth(60))
-		v.repoTable.SetCell(row, 2, tview.NewTableCell(" "+mut).SetTextColor(mutColor))
 		scanText := "off"
 		scanColor := tcell.ColorRed
 		if repo.ScanOnPush {
 			scanText = "on"
 			scanColor = tcell.ColorGreen
 		}
+		v.repoTable.SetCell(row, 0, tview.NewTableCell(" "+repo.Name).SetTextColor(tcell.ColorWhite))
+		v.repoTable.SetCell(row, 1, tview.NewTableCell(" "+repo.URI).SetTextColor(tcell.ColorDarkGray).SetMaxWidth(60))
+		v.repoTable.SetCell(row, 2, tview.NewTableCell(" "+mut).SetTextColor(mutColor))
 		v.repoTable.SetCell(row, 3, tview.NewTableCell(" "+scanText).SetTextColor(scanColor))
 		v.repoTable.SetCell(row, 4, tview.NewTableCell(" "+created).SetTextColor(tcell.ColorDarkGray))
 	}
@@ -87,35 +86,45 @@ func (v *ECRView) updateRepoTable() {
 	}
 }
 
+// openImages shows a loading page instantly, then fetches images in the background.
 func (v *ECRView) openImages(repo aws.ECRRepository) {
-	ctx := context.Background()
-	images, err := v.client.ListImages(ctx, repo.Name)
-	if err != nil {
-		return
-	}
-
-	// Sort: newest first
-	sort.Slice(images, func(i, j int) bool {
-		return images[i].PushedAt.After(images[j].PushedAt)
-	})
-
-	tv := tview.NewTextView().
-		SetDynamicColors(true).
-		SetScrollable(true)
-	tv.SetBorder(true).
-		SetTitle(fmt.Sprintf(" Images: %s  <Esc> Back ", repo.Name))
+	// Step 1: show loading page — no API call, instant.
+	tv := loadingText(fmt.Sprintf(" Images: %s ", repo.Name))
 	tv.SetInputCapture(escBack(v.app, v.pages, "list", v.repoTable))
+	v.pages.AddAndSwitchToPage("images", tv, true)
+	v.app.SetFocus(tv)
 
+	// Step 2: fetch in background.
+	go func() {
+		ctx := context.Background()
+		images, err := v.client.ListImages(ctx, repo.Name)
+		if err != nil {
+			v.app.QueueUpdateDraw(func() {
+				tv.SetText(fmt.Sprintf("  [red]Error: %s[-]", err))
+			})
+			return
+		}
+		sort.Slice(images, func(i, j int) bool {
+			return images[i].PushedAt.After(images[j].PushedAt)
+		})
+		text := renderImages(repo, images)
+		v.app.QueueUpdateDraw(func() {
+			tv.SetTitle(fmt.Sprintf(" Images: %s  <Esc> Back ", repo.Name))
+			tv.SetText(text)
+		})
+	}()
+}
+
+func renderImages(repo aws.ECRRepository, images []aws.ECRImage) string {
 	text := fmt.Sprintf("[aqua::b]  %s[-:-:-]\n", repo.Name)
 	text += fmt.Sprintf("  [darkgray]URI: %s[-]\n\n", repo.URI)
 	text += fmt.Sprintf("  [yellow]Mutability  [-][white]%s[-]    [yellow]Scan on Push  [-][white]%v[-]\n\n",
 		repo.Mutability, repo.ScanOnPush)
-
 	text += fmt.Sprintf("  [yellow::b]Images (%d)[-:-:-]\n\n", len(images))
+
 	if len(images) == 0 {
 		text += "  [darkgray]No images found[-]\n"
 	}
-
 	for _, img := range images {
 		tags := "  [darkgray](untagged)[-]"
 		if len(img.Tags) > 0 {
@@ -138,11 +147,8 @@ func (v *ECRView) openImages(repo aws.ECRRepository) {
 		text += fmt.Sprintf("    [darkgray]digest:[-] [white]%s[-]  [darkgray]size:[-] [white]%s[-]  [darkgray]pushed:[-] [white]%s[-]%s\n\n",
 			digest, size, pushed, scan)
 	}
-
 	text += "  [darkgray][Esc] Back[-]"
-	tv.SetText(text)
-	v.pages.AddAndSwitchToPage("images", tv, true)
-	v.app.SetFocus(tv)
+	return text
 }
 
 func formatBytes(b int64) string {
