@@ -65,6 +65,11 @@ func (v *EKSView) Refresh(ctx context.Context) {
 
 func (v *EKSView) updateEKSTable() {
 	v.eksTable.Clear()
+	if v.filter != "" {
+		v.eksTable.SetTitle(fmt.Sprintf(" EKS Clusters  /%s  </> Filter ", v.filter))
+	} else {
+		v.eksTable.SetTitle(" EKS Clusters  <Enter> Details  </> Filter ")
+	}
 	for col, h := range []string{"NAME", "STATUS", "VERSION", "VPC", "ENDPOINT"} {
 		v.eksTable.SetCell(0, col, headerCell(h))
 	}
@@ -98,17 +103,20 @@ func (v *EKSView) updateEKSTable() {
 }
 
 func (v *EKSView) openFilter() {
+	prev := v.filter
 	input := tview.NewInputField().
 		SetLabel("  / Filter: ").
 		SetFieldWidth(30).
 		SetText(v.filter).
 		SetFieldTextColor(tcell.ColorWhite).
 		SetFieldBackgroundColor(tcell.ColorDarkSlateBlue)
+	input.SetChangedFunc(func(text string) {
+		v.filter = text
+		v.updateEKSTable()
+	})
 	input.SetDoneFunc(func(key tcell.Key) {
-		if key == tcell.KeyEnter {
-			v.filter = input.GetText()
-		} else {
-			v.filter = ""
+		if key != tcell.KeyEnter {
+			v.filter = prev // Esc reverts to whatever was active before
 		}
 		v.pages.RemovePage("filter")
 		v.app.SetFocus(v.eksTable)

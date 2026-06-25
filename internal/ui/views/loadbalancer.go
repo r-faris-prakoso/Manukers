@@ -66,6 +66,11 @@ func (v *LBView) Refresh(ctx context.Context) {
 
 func (v *LBView) updateLBTable() {
 	v.lbTable.Clear()
+	if v.filter != "" {
+		v.lbTable.SetTitle(fmt.Sprintf(" Load Balancers  /%s  </> Filter ", v.filter))
+	} else {
+		v.lbTable.SetTitle(" Load Balancers  <Enter> Listeners  </> Filter ")
+	}
 	for col, h := range []string{"NAME", "TYPE", "STATE", "SCHEME", "VPC", "DNS NAME"} {
 		v.lbTable.SetCell(0, col, headerCell(h))
 	}
@@ -98,17 +103,20 @@ func (v *LBView) updateLBTable() {
 }
 
 func (v *LBView) openFilter() {
+	prev := v.filter
 	input := tview.NewInputField().
 		SetLabel("  / Filter: ").
 		SetFieldWidth(30).
 		SetText(v.filter).
 		SetFieldTextColor(tcell.ColorWhite).
 		SetFieldBackgroundColor(tcell.ColorDarkSlateBlue)
+	input.SetChangedFunc(func(text string) {
+		v.filter = text
+		v.updateLBTable()
+	})
 	input.SetDoneFunc(func(key tcell.Key) {
-		if key == tcell.KeyEnter {
-			v.filter = input.GetText()
-		} else {
-			v.filter = ""
+		if key != tcell.KeyEnter {
+			v.filter = prev // Esc reverts to whatever was active before
 		}
 		v.pages.RemovePage("filter")
 		v.app.SetFocus(v.lbTable)
@@ -180,9 +188,8 @@ func (v *LBView) openListeners(lb aws.LoadBalancer) {
 // QueueUpdateDraw here for the initial setup; call tview methods directly.
 func (v *LBView) openRules(lb aws.LoadBalancer, listener aws.Listener) {
 	// Step 1: instant loading page — direct calls, we are on the main loop.
-	title := fmt.Sprintf(" Rules: %s :%d ", lb.Name, listener.Port)
-	loading := loadingText(title)
-	// Pass listenersTable so Esc correctly refocuses the listeners list.
+	baseTitle := fmt.Sprintf(" Rules: %s :%d ", lb.Name, listener.Port)
+	loading := loadingText(baseTitle)
 	loading.SetInputCapture(escBack(v.app, v.pages, "listeners", v.listenersTable))
 	v.pages.AddAndSwitchToPage("rules", loading, true)
 	v.app.SetFocus(loading)
@@ -198,66 +205,151 @@ func (v *LBView) openRules(lb aws.LoadBalancer, listener aws.Listener) {
 			return
 		}
 
-		text := buildRulesText(lb, listener, rules)
-
 		v.app.QueueUpdateDraw(func() {
-			loading.SetTitle(fmt.Sprintf(" Rules: %s :%d  <Esc> Back ", lb.Name, listener.Port))
-			loading.SetText(text)
+			doneTitle := fmt.Sprintf(" Rules: %s :%d  </> Filter  <Esc> Back ", lb.Name, listener.Port)
+			loading.SetTitle(doneTitle)
+			loading.SetText(buildRulesText(lb, listener, rules, ""))
+
+			var rulesFilter string
+			loading.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+				if event.Key() == tcell.KeyEscape {
+					v.pages.SwitchToPage("listeners")
+					if v.listenersTable != nil {
+						v.app.SetFocus(v.listenersTable)
+					}
+					return nil
+				}
+				if event.Rune() == '/' {
+					prev := rulesFilter
+					input := tview.NewInputField().
+						SetLabel("  / Filter: ").
+						SetFieldWidth(30).
+						SetText(rulesFilter).
+						SetFieldTextColor(tcell.ColorWhite).
+						SetFieldBackgroundColor(tcell.ColorDarkSlateBlue)
+					input.SetChangedFunc(func(text string) {
+						rulesFilter = text
+						if rulesFilter != "" {
+							loading.SetTitle(fmt.Sprintf(" Rules: %s :%d  /%s  </> Filter  <Esc> Back ", lb.Name, listener.Port, rulesFilter))
+						} else {
+							loading.SetTitle(doneTitle)
+						}
+						loading.SetText(buildRulesText(lb, listener, rules, rulesFilter))
+					})
+					input.SetDoneFunc(func(key tcell.Key) {
+						if key != tcell.KeyEnter {
+							rulesFilter = prev
+							loading.SetText(buildRulesText(lb, listener, rules, rulesFilter))
+						}
+						if rulesFilter != "" {
+							loading.SetTitle(fmt.Sprintf(" Rules: %s :%d  /%s  </> Filter  <Esc> Back ", lb.Name, listener.Port, rulesFilter))
+						} else {
+							loading.SetTitle(doneTitle)
+						}
+						v.pages.RemovePage("rulesFilter")
+						v.app.SetFocus(loading)
+					})
+					filterLayout := tview.NewFlex().SetDirection(tview.FlexRow).
+						AddItem(loading, 0, 1, false).
+						AddItem(input, 1, 0, true)
+					v.pages.AddAndSwitchToPage("rulesFilter", filterLayout, true)
+					v.app.SetFocus(input)
+					return nil
+				}
+				return event
+			})
 		})
 	}()
 }
 
 // ─── Text builders ────────────────────────────────────────────────────────────
 
-func buildRulesText(lb aws.LoadBalancer, listener aws.Listener, rules []aws.Rule) string {
-	text := fmt.Sprintf("[aqua::b]%s  Port %d / %s[-:-:-]\n\n", lb.Name, listener.Port, listener.Protocol)
+func buildRulesText(lb aws.LoadBalancer, listener aws.Listener, rules []aws.Rule, filter string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "[aqua::b]%s  Port %d / %s[-:-:-]\n\n", lb.Name, listener.Port, listener.Protocol)
 	if listener.SSLPolicy != "" {
-		text += fmt.Sprintf("[darkgray]SSL Policy: %s[-]\n\n", listener.SSLPolicy)
+		fmt.Fprintf(&b, "[darkgray]SSL Policy: %s[-]\n\n", listener.SSLPolicy)
 	}
+	lf := strings.ToLower(filter)
+	matched := 0
 	for _, rule := range rules {
 		pri := rule.Priority
 		if rule.IsDefault {
 			pri = "default"
 		}
-		text += fmt.Sprintf("[yellow::b]Priority: %s[-:-:-]\n", pri)
-		if len(rule.Conditions) > 0 {
-			text += "  [darkgray]Conditions:[-]\n"
+		if filter != "" {
+			var hb strings.Builder
+			hb.WriteString(strings.ToLower(pri))
 			for _, cond := range rule.Conditions {
-				text += fmt.Sprintf("    [white]%s[-] [darkgray]=[-] [aqua]%s[-]\n",
+				hb.WriteByte(' ')
+				hb.WriteString(strings.ToLower(cond.Field))
+				hb.WriteByte(' ')
+				hb.WriteString(strings.ToLower(strings.Join(cond.Values, " ")))
+			}
+			for _, action := range rule.Actions {
+				hb.WriteByte(' ')
+				hb.WriteString(strings.ToLower(action.Type))
+				hb.WriteByte(' ')
+				hb.WriteString(strings.ToLower(action.TargetGroupARN))
+				for _, ft := range action.ForwardTargets {
+					hb.WriteByte(' ')
+					hb.WriteString(strings.ToLower(ft.ARN))
+				}
+			}
+			if !strings.Contains(hb.String(), lf) {
+				continue
+			}
+		}
+		matched++
+		fmt.Fprintf(&b, "[yellow::b]Priority: %s[-:-:-]\n", pri)
+		if len(rule.Conditions) > 0 {
+			b.WriteString("  [darkgray]Conditions:[-]\n")
+			for _, cond := range rule.Conditions {
+				fmt.Fprintf(&b, "    [white]%s[-] [darkgray]=[-] [aqua]%s[-]\n",
 					cond.Field, strings.Join(cond.Values, ", "))
 			}
 		}
 		if len(rule.Actions) > 0 {
-			text += "  [darkgray]Actions:[-]\n"
+			b.WriteString("  [darkgray]Actions:[-]\n")
 			for _, action := range rule.Actions {
 				switch action.Type {
 				case "forward":
-					tgName := action.TargetGroupARN
-					if action.TargetGroupName != "" {
-						tgName = action.TargetGroupName
+					if len(action.ForwardTargets) > 0 {
+						b.WriteString("    [green]→ forward[-]\n")
+						for _, ft := range action.ForwardTargets {
+							if ft.Weight > 0 {
+								fmt.Fprintf(&b, "      [white]%s[-]  [darkgray](weight: %d)[-]\n", ft.ARN, ft.Weight)
+							} else {
+								fmt.Fprintf(&b, "      [white]%s[-]\n", ft.ARN)
+							}
+						}
+					} else {
+						fmt.Fprintf(&b, "    [green]→ forward[-] [white]%s[-]\n", action.TargetGroupARN)
 					}
-					w := ""
-					if action.Weight > 0 {
-						w = fmt.Sprintf(" (weight: %d)", action.Weight)
-					}
-					text += fmt.Sprintf("    [green]→ forward[-] [white]%s[-][darkgray]%s[-]\n", tgName, w)
 				case "redirect":
 					if action.RedirectConfig != nil {
-						text += fmt.Sprintf("    [yellow]→ redirect[-] [white]%s://%s  %s[-]\n",
+						fmt.Fprintf(&b, "    [yellow]→ redirect[-] [white]%s://%s  %s[-]\n",
 							action.RedirectConfig.Protocol,
 							action.RedirectConfig.Port,
 							action.RedirectConfig.StatusCode)
 					}
 				case "fixed-response":
-					text += "    [red]→ fixed-response[-]\n"
+					b.WriteString("    [red]→ fixed-response[-]\n")
 				default:
-					text += fmt.Sprintf("    [darkgray]→ %s[-]\n", action.Type)
+					fmt.Fprintf(&b, "    [darkgray]→ %s[-]\n", action.Type)
 				}
 			}
 		}
-		text += "\n"
+		b.WriteByte('\n')
 	}
-	return text
+	if matched == 0 {
+		if filter != "" {
+			fmt.Fprintf(&b, "  [darkgray]No rules match \"%s\"[-]\n", filter)
+		} else {
+			b.WriteString("  [darkgray]No rules found[-]\n")
+		}
+	}
+	return b.String()
 }
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────

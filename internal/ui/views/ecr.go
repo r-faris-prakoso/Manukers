@@ -64,6 +64,11 @@ func (v *ECRView) Refresh(ctx context.Context) {
 
 func (v *ECRView) updateRepoTable() {
 	v.repoTable.Clear()
+	if v.filter != "" {
+		v.repoTable.SetTitle(fmt.Sprintf(" ECR Repositories  /%s  </> Filter ", v.filter))
+	} else {
+		v.repoTable.SetTitle(" ECR Repositories  <Enter> Images  </> Filter ")
+	}
 	for col, h := range []string{"NAME", "URI", "MUTABILITY", "SCAN ON PUSH", "CREATED"} {
 		v.repoTable.SetCell(0, col, headerCell(h))
 	}
@@ -106,17 +111,20 @@ func (v *ECRView) updateRepoTable() {
 }
 
 func (v *ECRView) openFilter() {
+	prev := v.filter
 	input := tview.NewInputField().
 		SetLabel("  / Filter: ").
 		SetFieldWidth(30).
 		SetText(v.filter).
 		SetFieldTextColor(tcell.ColorWhite).
 		SetFieldBackgroundColor(tcell.ColorDarkSlateBlue)
+	input.SetChangedFunc(func(text string) {
+		v.filter = text
+		v.updateRepoTable()
+	})
 	input.SetDoneFunc(func(key tcell.Key) {
-		if key == tcell.KeyEnter {
-			v.filter = input.GetText()
-		} else {
-			v.filter = ""
+		if key != tcell.KeyEnter {
+			v.filter = prev // Esc reverts to whatever was active before
 		}
 		v.pages.RemovePage("filter")
 		v.app.SetFocus(v.repoTable)

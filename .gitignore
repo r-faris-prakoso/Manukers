@@ -1,0 +1,19 @@
+# Build output
+manukers
+
+# Go toolchain
+*.test
+*.out
+vendor/
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude Code local settings
+.claude/settings.local.json

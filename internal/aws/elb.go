@@ -80,10 +80,11 @@ func (c *Client) GetRules(ctx context.Context, listenerARN string) ([]Rule, erro
 			}
 			if action.ForwardConfig != nil {
 				for _, tg := range action.ForwardConfig.TargetGroups {
-					ra.TargetGroupARN = ptrStr(tg.TargetGroupArn)
+					ft := ForwardTarget{ARN: ptrStr(tg.TargetGroupArn)}
 					if tg.Weight != nil {
-						ra.Weight = *tg.Weight
+						ft.Weight = *tg.Weight
 					}
+					ra.ForwardTargets = append(ra.ForwardTargets, ft)
 				}
 			}
 			if action.RedirectConfig != nil {

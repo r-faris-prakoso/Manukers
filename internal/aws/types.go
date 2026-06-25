@@ -82,11 +82,16 @@ type RuleCondition struct {
 }
 
 type RuleAction struct {
-	Type            string
-	TargetGroupARN  string
-	TargetGroupName string
-	Weight          int32
-	RedirectConfig  *RedirectConfig
+	Type           string
+	ForwardTargets []ForwardTarget // all TGs when ForwardConfig is present
+	TargetGroupARN string          // fallback for simple single-TG forward
+	Weight         int32
+	RedirectConfig *RedirectConfig
+}
+
+type ForwardTarget struct {
+	ARN    string
+	Weight int32
 }
 
 type RedirectConfig struct {
