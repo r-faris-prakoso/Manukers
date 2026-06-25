@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "manukers"
+version = "0.1.0"
+description = "AWS CLI Dashboard — ALB rules, health, and EKS status"
+requires-python = ">=3.9"
+dependencies = [
+    "boto3>=1.26.0",
+]
+
+[project.scripts]
+manukers = "manukers:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/manukers"]
